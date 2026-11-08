@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rea-homework-bot"
+version = "0.1.0"
+description = "Домашние задания к расписанию РЭУ в Telegram"
+requires-python = ">=3.12"
+dependencies = ["aiogram==3.31.0", "httpx==0.28.1", "beautifulsoup4==4.15.0", "python-dotenv==1.2.4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1"]
+
+[project.scripts]
+rea-bot = "rea_bot.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["rea_bot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+
+[tool.setuptools.package-data]
+rea_bot = ["data/*.json"]
