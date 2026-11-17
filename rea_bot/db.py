@@ -8,6 +8,27 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .migrations import migrate, open_database
+
+MAX_ATTACHMENTS = 10
+
+
+def homework_attachments(record):
+    attachments = record.get("attachments")
+    if attachments is not None:
+        return json.loads(attachments) if isinstance(attachments, str) else attachments
+    if record.get("file_id"):
+        return [{"file_id": record["file_id"], "file_kind": record["file_kind"]}]
+    return []
+
+
+def attachment_name(file, index):
+    if file.get("name"):
+        return file["name"]
+    if file["file_kind"] == "photo":
+        return f"Фото {index + 1}.jpg"
+    return f"Файл {index + 1}"
+
 
 class UserError(Exception):
     """Safe, user-facing error."""
@@ -17,61 +38,24 @@ class Store:
     def __init__(self, path, admins=()):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
         self.admins = frozenset(admins)
-        self.conn.executescript("""
-        PRAGMA foreign_keys=ON;
-        PRAGMA journal_mode=WAL;
-        PRAGMA busy_timeout=5000;
-        CREATE TABLE IF NOT EXISTS groups (
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
-          faculty TEXT NOT NULL, course TEXT NOT NULL, level TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE,
-          name TEXT NOT NULL, seen REAL NOT NULL, head_allowed INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS members (
-          user_id INTEGER PRIMARY KEY REFERENCES users(id),
-          group_id INTEGER NOT NULL REFERENCES groups(id),
-          role TEXT NOT NULL CHECK(role IN ('student','editor','head')));
-        CREATE UNIQUE INDEX IF NOT EXISTS one_head_per_group ON members(group_id) WHERE role='head';
-        CREATE TABLE IF NOT EXISTS lessons (
-          id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL REFERENCES groups(id),
-          source_key TEXT NOT NULL, day TEXT NOT NULL, slot INTEGER NOT NULL,
-          start TEXT NOT NULL, finish TEXT NOT NULL, subject TEXT NOT NULL,
-          kind TEXT NOT NULL, details TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
-          UNIQUE(group_id,source_key));
-        CREATE INDEX IF NOT EXISTS lesson_days ON lessons(group_id,day);
-        CREATE TABLE IF NOT EXISTS homework (
-          id INTEGER PRIMARY KEY, lesson_id INTEGER NOT NULL REFERENCES lessons(id),
-          body TEXT NOT NULL, file_id TEXT, file_kind TEXT,
-          author INTEGER NOT NULL REFERENCES users(id), updated_by INTEGER NOT NULL REFERENCES users(id),
-          created REAL NOT NULL, updated REAL NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
-          deleted INTEGER NOT NULL DEFAULT 0,
-          CHECK(file_kind IS NULL OR file_kind IN ('photo','document')));
-        CREATE TABLE IF NOT EXISTS audit (
-          id INTEGER PRIMARY KEY, actor INTEGER NOT NULL, action TEXT NOT NULL,
-          target TEXT NOT NULL, payload TEXT NOT NULL, at REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS cache (
-          key TEXT PRIMARY KEY, value TEXT NOT NULL, fetched REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS ui_tokens (
-          token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
-          payload TEXT NOT NULL, expires REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS document_cache (
-          source_id TEXT PRIMARY KEY, document_id TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS ui_screens (
-          user_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-          payload TEXT NOT NULL, updated REAL NOT NULL,
-          PRIMARY KEY(user_id,message_id));
-        CREATE TABLE IF NOT EXISTS pending_members (
-          username TEXT PRIMARY KEY COLLATE NOCASE, group_id INTEGER NOT NULL REFERENCES groups(id),
-          created_by INTEGER NOT NULL REFERENCES users(id), created REAL NOT NULL, expires REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions (
-          user_id INTEGER PRIMARY KEY, payload TEXT NOT NULL, expires REAL NOT NULL);
-        """)
+        self._engine = open_database(path)
+        try:
+            with self._engine.begin() as connection:
+                self.migration = migrate(connection)
+            # The engine owns the connection lifetime. Runtime queries retain the
+            # existing sqlite3 API and authorization/transaction boundaries.
+            self._raw = self._engine.raw_connection()
+            self.conn = self._raw.driver_connection
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            self._engine.dispose()
+            raise
 
     def close(self):
-        self.conn.close()
+        self._raw.close()
+        self._engine.dispose()
 
     @contextmanager
     def transaction(self):
@@ -365,14 +349,121 @@ class Store:
         self.lesson(uid, row["lesson_id"], level)
         return row
 
+    @staticmethod
+    def material_scope(lesson):
+        return lesson["group_id"], " ".join(lesson["subject"].split()).casefold()
+
+    def subject_materials(self, uid, lid):
+        lesson = self.lesson(uid, lid)
+        return self.all(
+            "SELECT * FROM subject_materials WHERE group_id=? AND subject_key=? AND deleted=0 ORDER BY id DESC",
+            self.material_scope(lesson),
+        )
+
+    def subject_material(self, uid, lid, material_id, level="read"):
+        lesson = self.lesson(uid, lid, level)
+        material = self.one(
+            "SELECT * FROM subject_materials WHERE group_id=? AND subject_key=? AND id=? AND deleted=0",
+            (*self.material_scope(lesson), material_id),
+        )
+        if not material:
+            raise UserError("Файл в материалах этого предмета не найден.")
+        return material
+
+    def homework_files_for_edit(self, uid, hid, revision, level="write"):
+        homework = self.homework_item(uid, hid, level)
+        if homework["revision"] != revision:
+            raise UserError("Список файлов изменился. Откройте его заново.")
+        return homework, homework_attachments(homework)
+
+    def save_subject_material(self, uid, hid, index, revision):
+        with self.transaction():
+            homework, files = self.homework_files_for_edit(uid, hid, revision, "manage")
+            if not 0 <= index < len(files):
+                raise UserError("Список файлов изменился. Откройте его заново.")
+            lesson = self.lesson(uid, homework["lesson_id"])
+            file = files[index]
+            return self._save_material(
+                uid, lesson, file, attachment_name(file, index), {"homework": hid}
+            )
+
+    def upload_subject_material(self, uid, lid, file):
+        with self.transaction():
+            lesson = self.lesson(uid, lid, "manage")
+            return self._save_material(uid, lesson, file, file["name"], {"lesson": lid})
+
+    def _save_material(self, uid, lesson, file, name, source):
+        material = self.one(
+            """INSERT INTO subject_materials(group_id,subject_key,file_id,name,file_kind)
+            VALUES(?,?,?,?,?) ON CONFLICT(group_id,subject_key,file_id)
+            DO UPDATE SET deleted=0,name=excluded.name WHERE subject_materials.deleted=1
+            RETURNING id""",
+            (*self.material_scope(lesson), file["file_id"], name, file["file_kind"]),
+        )
+        if material:
+            self.log(uid, "save_subject_material", material["id"], source)
+        return material is not None
+
+    def delete_subject_material(self, uid, lid, material_id):
+        with self.transaction():
+            self.subject_material(uid, lid, material_id, "manage")
+            self.conn.execute("UPDATE subject_materials SET deleted=1 WHERE id=?", (material_id,))
+            self.log(uid, "delete_subject_material", material_id, {"lesson": lid})
+
+    def set_subject_material_attachment(self, uid, hid, revision, material_id, detach=False):
+        homework, files = self.homework_files_for_edit(uid, hid, revision, "manage")
+        lid = homework["lesson_id"]
+        material = self.subject_material(uid, lid, material_id)
+        other_files = [file for file in files if file["file_id"] != material["file_id"]]
+        already_attached = len(other_files) != len(files)
+        if detach:
+            if not already_attached:
+                raise UserError("Этот файл уже откреплён от ДЗ.")
+            if not other_files and not homework["body"].strip():
+                raise UserError(
+                    "Это единственный файл в ДЗ. Сначала добавьте текст или другой файл."
+                )
+            files = other_files
+        else:
+            if already_attached:
+                raise UserError("Этот файл уже прикреплён к ДЗ.")
+            files.append({key: material[key] for key in ("file_id", "file_kind", "name")})
+        self.save_homework(
+            uid, lid, homework["body"], hid=hid, revision=revision, attachments=files
+        )
+
     def save_homework(
-        self, uid, lid, body, file_id=None, file_kind=None, hid=None, revision=None, token=None
+        self,
+        uid,
+        lid,
+        body,
+        file_id=None,
+        file_kind=None,
+        hid=None,
+        revision=None,
+        token=None,
+        attachments=None,
     ):
         body = body.strip()
-        if (not body and not file_id) or len(body) > 3000:
-            raise UserError("Отправьте текст до 3000 символов, фотографию или документ с подписью.")
         if (file_id is None) != (file_kind is None) or file_kind not in (None, "photo", "document"):
             raise UserError("Неподдерживаемый тип вложения.")
+        files = homework_attachments(
+            {"attachments": attachments, "file_id": file_id, "file_kind": file_kind}
+        )
+        if (not body and not files) or len(body) > 3000:
+            raise UserError("Добавьте текст до 3000 символов или вложение.")
+        if len(files) > MAX_ATTACHMENTS:
+            raise UserError(f"К одному ДЗ можно прикрепить до {MAX_ATTACHMENTS} файлов.")
+        if any(
+            not isinstance(file, dict)
+            or not isinstance(file.get("file_id"), str)
+            or not file["file_id"]
+            or file.get("file_kind") not in ("photo", "document")
+            for file in files
+        ):
+            raise UserError("Неподдерживаемый тип вложения.")
+        first = files[0] if files else {"file_id": None, "file_kind": None}
+        serialized = json.dumps(files)
         with self.transaction():
             if token:
                 saved = self.token_get(uid, token)
@@ -385,6 +476,10 @@ class Store:
                     "hid": hid,
                     "revision": revision,
                 }
+                if attachments is not None:
+                    expected.pop("file_id")
+                    expected.pop("file_kind")
+                    expected["attachments"] = attachments
                 # Body is normalized on write, but the immutable preview must still match.
                 saved["body"] = saved.get("body", "").strip()
                 if saved != expected:
@@ -402,16 +497,26 @@ class Store:
                         "Задание уже изменили. Откройте его заново, чтобы не затереть чужие изменения."
                     )
                 self.conn.execute(
-                    """UPDATE homework SET body=?,file_id=?,file_kind=?,updated_by=?,updated=?,revision=revision+1
+                    """UPDATE homework SET body=?,file_id=?,file_kind=?,attachments=?,updated_by=?,updated=?,revision=revision+1
                   WHERE id=?""",
-                    (body, file_id, file_kind, uid, now, hid),
+                    (body, first["file_id"], first["file_kind"], serialized, uid, now, hid),
                 )
                 self.log(uid, "edit_homework", hid, old)
             else:
                 hid = self.conn.execute(
-                    """INSERT INTO homework(lesson_id,body,file_id,file_kind,author,updated_by,created,updated)
-                  VALUES(?,?,?,?,?,?,?,?)""",
-                    (lid, body, file_id, file_kind, uid, uid, now, now),
+                    """INSERT INTO homework(lesson_id,body,file_id,file_kind,attachments,author,updated_by,created,updated)
+                  VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        lid,
+                        body,
+                        first["file_id"],
+                        first["file_kind"],
+                        serialized,
+                        uid,
+                        uid,
+                        now,
+                        now,
+                    ),
                 ).lastrowid
                 self.log(uid, "add_homework", hid, {"lesson": lid})
             if token:

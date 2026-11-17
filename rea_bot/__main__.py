@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ from aiogram.types import BotCommand
 from .bot import build_dispatcher
 from .config import Settings
 from .db import Store
+from .healthcheck import PollingHealth
 from .refresh import ScheduleRefresh
 from .schedule import ReaClient, parse_week
 from .snapshots import restore_schedules
@@ -23,6 +25,8 @@ from .snapshots import restore_schedules
 async def run(settings):
     if not settings.token:
         raise SystemExit("Заполните BOT_TOKEN в .env (см. .env.example).")
+    health = PollingHealth(os.getenv("HEALTHCHECK_FILE"))
+    health.clear()
     store = Store(settings.database, settings.admins)
     restore_schedules(store, settings)
     schedule = ReaClient(store, settings)
@@ -32,6 +36,7 @@ async def run(settings):
         async with Bot(
             settings.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
         ) as bot:
+            bot.session.middleware(health)
             if not settings.admins:
                 logging.getLogger(__name__).warning(
                     "SUPERADMIN_IDS is empty. Use /id, then configure the owner and restart."
@@ -46,9 +51,10 @@ async def run(settings):
                 ]
             )
             await build_dispatcher(store, schedule, settings, refresher).start_polling(
-                bot, allowed_updates=["message", "callback_query"]
+                bot, allowed_updates=["message", "callback_query"], polling_timeout=30
             )
     finally:
+        health.clear()
         refresh_task.cancel()
         with suppress(asyncio.CancelledError):
             await refresh_task
@@ -95,6 +101,8 @@ async def smoke(settings, course, level, group, monday):
 def main():
     parser = argparse.ArgumentParser(description="ДЗ РЭУ · Telegram")
     sub = parser.add_subparsers(dest="command")
+    migration = sub.add_parser("migrate-db", help="Обновить SQLite без запуска бота и запросов к сети")
+    migration.add_argument("--database", help="Путь к базе; по умолчанию DATABASE_PATH из .env")
     check = sub.add_parser(
         "check-schedule", help="До 5 последовательных запросов: один курс/уровень/группа"
     )
@@ -108,7 +116,20 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = Settings.from_env()
-    if args.command == "check-schedule":
+    if args.command == "migrate-db":
+        database = Path(args.database or settings.database)
+        if not database.is_file():
+            parser.error(f"База не найдена: {database}. Укажите путь к существующей базе.")
+        store = Store(str(database))
+        try:
+            result = store.migration
+            print(f"Версия базы: {result.previous_version} → {result.version}")
+            print("Применено: " + (", ".join(result.applied) or "база уже обновлена"))
+            if result.backup:
+                print(f"Резервная копия: {result.backup}")
+        finally:
+            store.close()
+    elif args.command == "check-schedule":
         asyncio.run(smoke(settings, args.course, args.level, args.group, args.monday))
     elif args.command == "parse-schedule":
         print(json.dumps(parse_week(args.file.read_text()), ensure_ascii=False, indent=2))

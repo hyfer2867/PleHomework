@@ -4,6 +4,7 @@ import re
 import weakref
 from datetime import date, datetime, timedelta
 from html import escape, unescape
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Dispatcher, Router
@@ -12,21 +13,61 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
     Message,
 )
 
-from .db import UserError
-from .navigation import Screen
+from .db import MAX_ATTACHMENTS, UserError, attachment_name, homework_attachments
+from .navigation import Screen, attachment_message
 from .refresh import ScheduleRefresh
 from .schedule import ScheduleError, clean_details
 
 ROLES = {
-    "superadmin": "",
+    "superadmin": "суперадмин",
     "head": "староста",
     "editor": "редактор ДЗ",
     "student": "студент",
 }
 DAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
+class HomeworkAlbums(BaseMiddleware):
+    def __init__(self, store):
+        self.store = store
+        self.pending = {}
+
+    async def __call__(self, handler, message, data):
+        state = self.store.session_get(message.from_user.id) if message.from_user else None
+        if (
+            not message.media_group_id
+            or message.chat.type != "private"
+            or not state
+            or state["state"] not in ("write", "preview")
+        ):
+            return await handler(message, data)
+        key = (message.chat.id, message.media_group_id)
+        if key in self.pending:
+            self.pending[key].append(message)
+            return
+        album = self.pending[key] = [message]
+        try:
+            while True:
+                count = len(album)
+                await asyncio.sleep(0.5)
+                if count == len(album):
+                    break
+            current = self.store.session_get(message.from_user.id)
+            identity = ("screen_id", "lid", "hid", "revision", "draft_id")
+            if (
+                not current
+                or current["state"] not in ("write", "preview")
+                or any(current.get(field) != state.get(field) for field in identity)
+            ):
+                return
+            data["album"] = sorted(album, key=lambda item: item.message_id)
+            return await handler(message, data)
+        finally:
+            self.pending.pop(key, None)
 
 
 class PrivateAccess(BaseMiddleware):
@@ -84,54 +125,53 @@ class BotUI:
         return InlineKeyboardMarkup(inline_keyboard=result)
 
     async def home(self, msg, uid):
-        msg.route("home")
         self.db.session_clear(uid)
         member = self.db.membership(uid)
+        if member and not self.db.is_admin(uid):
+            await self.group(msg, uid, member["group_id"])
+            return
+        msg.route("home")
         rows = []
         if self.db.is_admin(uid):
-            text = "<b>ДЗ · РЭУ</b>\nВыберите группу или назначьте старосту."
-            rows.extend(
-                [
-                    [("📚 Группы", "groups", {}), ("👥 Старосты", "heads", {})],
-                    [("➕ Назначить старосту", "person", {"operation": "appoint"})],
-                ]
-            )
+            text = "<b>📚 PleHomework</b>\n\nВыберите группу или откройте список старост."
+            rows.append([("📚 Группы", "groups", {}), ("👥 Старосты", "heads", {})])
             rows.append([("🗓 Загрузить до конца года", "year_confirm", {})])
-        elif member:
-            text = f"<b>ДЗ · {escape(member['name'])}</b>\nВаша роль: {ROLES[member['role']]}"
-            rows.append([("📚 Моя группа", "group", {"gid": member["group_id"]})])
         else:
             text = (
-                "<b>ДЗ · РЭУ</b>\nВы зарегистрированы. Отправьте старосте свой @username "
-                f"или ID <code>{uid}</code>, чтобы он добавил вас в группу."
+                "<b>📚 PleHomework</b>\n\n"
+                "Отправьте старосте свой @username или ID, чтобы получить доступ к группе.\n\n"
+                f"Ваш ID · <code>{uid}</code>"
             )
         if self.db.can_catalog(uid):
-            rows.append([("🎓 Выбрать группу · Форсайт", "catalog", {})])
+            label = "➕ Подключить группу" if self.db.is_admin(uid) else "🎓 Выбрать свою группу"
+            rows.append([(label, "catalog", {})])
         rows.append([("ℹ️ Помощь", "help", {})])
         await msg.answer(text, reply_markup=self.keyboard(uid, rows, home=False))
 
     async def group(self, msg, uid, gid):
         self.db.require(uid, gid)
-        msg.route("group", gid=gid)
         group = self.db.group(gid)
         role = self.db.role(uid, gid)
+        is_home = role != "superadmin"
+        msg.route("group", gid=gid, root=is_home)
         rows = [
             [
                 ("Сегодня", "week", {"gid": gid, "scope": "today"}),
                 ("Завтра", "week", {"gid": gid, "scope": "tomorrow"}),
             ],
-            [
-                ("📅 Расписание и ДЗ", "weeks", {"gid": gid}),
-                ("📝 Только ДЗ", "week", {"gid": gid, "scope": "hw"}),
-            ],
+            [("📅 Выбрать неделю", "weeks", {"gid": gid})],
+            [("📝 Все ДЗ за неделю", "week", {"gid": gid, "scope": "hw"})],
         ]
         if role in ("head", "superadmin"):
             rows.append([("👥 Участники и права", "members", {"gid": gid})])
+        if is_home:
+            rows.append([("ℹ️ Помощь", "help", {})])
         await msg.answer(
-            f"<b>{escape(group['name'])}</b>\n{escape(group['course'])} · {escape(group['level'])}\n"
-            + (f"Ваша роль: {ROLES[role]}.\n" if ROLES[role] else "")
-            + "Выберите день или неделю, затем пару.",
-            reply_markup=self.keyboard(uid, rows),
+            f"<b>📚 {escape(group['name'])}</b>\n"
+            f"<i>{escape(group['course'])} · {escape(group['level'])}</i>\n"
+            + (f"Ваша роль: <b>{ROLES[role]}</b>.\n" if role != "student" else "")
+            + "\nВыберите день или неделю, затем пару.",
+            reply_markup=self.keyboard(uid, rows, home=not is_home),
         )
 
     async def groups(self, msg, uid, page=0):
@@ -144,7 +184,7 @@ class BotUI:
             rows.append([("←", "groups", {"page": page - 1})])
         if len(groups) > (page + 1) * 8:
             rows.append([("→", "groups", {"page": page + 1})])
-        rows.append([("➕ Подключить группу · Форсайт", "catalog", {})])
+        rows.append([("➕ Подключить группу", "catalog", {})])
         await msg.answer(
             "<b>Подключённые группы</b>" if groups else "Пока нет подключённых групп.",
             reply_markup=self.keyboard(uid, rows),
@@ -241,29 +281,55 @@ class BotUI:
         msg.notice = f"✅ Расписание загружено до 31.12.{today.year}. Недель: {done}."
         await self.home(msg, uid)
 
-    async def weeks(self, msg, uid, gid, page=0):
-        weeks = self.db.saved_weeks(uid, gid)
-        page = max(0, min(page, max(0, (len(weeks) - 1) // 8)))
-        msg.route("weeks", gid=gid, page=page)
+    async def weeks(self, msg, uid, gid, page=0, past=False):
+        saved_weeks = self.db.saved_weeks(uid, gid)
+        today = self.today()
+        current = today - timedelta(days=today.weekday())
+        upcoming = current + timedelta(days=7)
+        if past:
+            weeks = [week for week in reversed(saved_weeks) if week["monday"] < current.isoformat()]
+        else:
+            weeks = [week for week in saved_weeks if week["monday"] > upcoming.isoformat()]
+        page_size = 8 if past else 6
+        page = max(0, min(page, max(0, (len(weeks) - 1) // page_size)))
+        msg.route("weeks", gid=gid, page=page, **({"past": True} if past else {}))
         rows = []
-        for week in weeks[page * 8 : page * 8 + 8]:
+        if not past:
+            for name, start in (("Текущая неделя", current), ("Следующая неделя", upcoming)):
+                end = start + timedelta(days=6)
+                label = f"{name} · {start:%d.%m}–{end:%d.%m}"
+                rows.append([(label, "week", {"gid": gid, "monday": start.isoformat()})])
+        for week in weeks[page * page_size : (page + 1) * page_size]:
             start, end = date.fromisoformat(week["monday"]), date.fromisoformat(week["sunday"])
             count = len(week["lessons"])
             label = f"{start:%d.%m}–{end:%d.%m.%Y} · пар: {count}"
             rows.append([(label, "week", {"gid": gid, "monday": week["monday"]})])
+        destination = {"gid": gid, "past": past}
         paging = []
         if page:
-            paging.append(("←", "weeks", {"gid": gid, "page": page - 1}))
-        if len(weeks) > (page + 1) * 8:
-            paging.append(("→", "weeks", {"gid": gid, "page": page + 1}))
+            paging.append(("←", "weeks", {**destination, "page": page - 1}))
+        if len(weeks) > (page + 1) * page_size:
+            paging.append(("→", "weeks", {**destination, "page": page + 1}))
         if paging:
             rows.append(paging)
-        rows.append([("Текущая неделя", "week", {"gid": gid})])
-        await msg.answer(
-            "<b>Сохранённые недели</b>\nВыберите период. Данные соответствуют последней загрузке с сайта."
-            + ("\nПока нет сохранённых недель." if not weeks else ""),
-            reply_markup=self.keyboard(uid, rows),
-        )
+        if past:
+            text = "<b>Прошедшие недели</b>"
+            if not weeks:
+                text += "\nПока нет сохранённых прошедших недель."
+        else:
+            text = "<b>Выберите неделю</b>"
+            rows.append([("🗂 Прошедшие недели", "weeks", {"gid": gid, "past": True})])
+        await msg.answer(text, reply_markup=self.keyboard(uid, rows))
+
+    def adjacent_weeks(self, gid, monday, today, scope):
+        buttons = []
+        for label, offset in (("← Неделя", -7), ("Неделя →", 7)):
+            start = monday + timedelta(days=offset)
+            if abs((start - today).days) <= 370 or self.db.cache_get(f"week:{gid}:{start}"):
+                buttons.append(
+                    (label, "week", {"gid": gid, "monday": start.isoformat(), "scope": scope})
+                )
+        return buttons
 
     async def week(self, msg, uid, gid, monday=None, scope="week", page=0, day=None):
         self.db.require(uid, gid)
@@ -274,12 +340,14 @@ class BotUI:
         if scope in ("today", "tomorrow"):
             scope, day = "day", target.isoformat()
         monday = date.fromisoformat(monday) if monday else target - timedelta(days=target.weekday())
-        if monday.weekday() != 0 or abs((monday - today).days) > 370:
-            raise UserError("Выберите неделю в пределах года от текущей даты.")
+        saved = self.db.cache_get(f"week:{gid}:{monday.isoformat()}")
+        if monday.weekday() != 0 or (not saved and abs((monday - today).days) > 370):
+            raise UserError(
+                "Выберите сохранённую неделю или неделю в пределах года от текущей даты."
+            )
         sunday = monday + timedelta(days=6)
         if scope == "day" and not monday <= target <= sunday:
             raise UserError("День не относится к выбранной неделе.")
-        saved = self.db.cache_get(f"week:{gid}:{monday.isoformat()}")
         if saved:
             updated = datetime.fromtimestamp(saved["fetched"], self.tz).strftime("%d.%m.%Y %H:%M")
             notice = f"Сохранённое расписание. Обновлено: {updated}."
@@ -319,22 +387,14 @@ class BotUI:
                     )
                 ]
             )
-            rows.append(
-                [
-                    (
-                        "← Неделя",
-                        "week",
-                        {"gid": gid, "monday": (monday - timedelta(days=7)).isoformat()},
-                    ),
-                    (
-                        "Неделя →",
-                        "week",
-                        {"gid": gid, "monday": (monday + timedelta(days=7)).isoformat()},
-                    ),
-                ]
-            )
+            adjacent = self.adjacent_weeks(gid, monday, today, scope)
+            if adjacent:
+                rows.append(adjacent)
             await msg.answer(
-                f"<b>{escape(self.db.group(gid)['name'])}</b>\n{monday:%d.%m.%Y} — {sunday:%d.%m.%Y}\n{escape(notice)}\n\nВыберите день недели.",
+                f"<b>📅 {escape(self.db.group(gid)['name'])}</b>\n"
+                f"<b>{monday:%d.%m.%Y} — {sunday:%d.%m.%Y}</b>\n\n"
+                "Выберите день недели.\n\n"
+                f"<i>{escape(notice)}</i>",
                 reply_markup=self.keyboard(uid, rows),
             )
             return
@@ -344,21 +404,29 @@ class BotUI:
             ]
             page = max(0, min(page, max(0, (len(tasks) - 1) // 5)))
             msg.route("week", gid=gid, monday=monday.isoformat(), scope=scope, page=page)
-            text = f"<b>Все ДЗ за неделю</b>\n{monday:%d.%m.%Y} — {sunday:%d.%m.%Y}\nВсего заданий: {len(tasks)}\n"
+            text = (
+                "<h2>📝 Все ДЗ за неделю</h2>"
+                f"<p><b>{monday:%d.%m.%Y} — {sunday:%d.%m.%Y}</b><br>"
+                f"{escape(self.db.group(gid)['name'])} · Всего заданий: <b>{len(tasks)}</b></p>"
+            )
             rows = []
+            previous_day = None
             for lesson, task in tasks[page * 5 : page * 5 + 5]:
-                label = f"{date.fromisoformat(lesson['day']):%d.%m} · {lesson['slot']} пара · {lesson['subject'][:70]}"
+                day = date.fromisoformat(lesson["day"])
+                label = f"{DAYS[day.weekday()]} · {day:%d.%m} · {lesson['slot']} пара · {lesson['subject'][:70]}"
                 body = task["body"] or "Задание во вложении."
+                if day != previous_day:
+                    text += f"<hr><h3>{DAYS[day.weekday()]} · {day:%d.%m}</h3>"
+                    previous_day = day
+                files = homework_attachments(task)
                 text += (
-                    "\n<b>"
-                    + escape(label)
-                    + "</b>"
+                    f"<p><b>📘 {escape(lesson['subject'][:100])} · {lesson['slot']} пара</b>"
                     + (" ⚠️ Пара изменилась" if not lesson["active"] else "")
-                    + "\n"
+                    + "</p><blockquote>"
                     + escape(body[:350])
                     + ("…" if len(body) > 350 else "")
-                    + (" 📎" if task["file_id"] else "")
-                    + "\n"
+                    + "</blockquote>"
+                    + (f"<p><i>📎 Вложений: {len(files)}</i></p><br>" if files else "")
                 )
                 task_page = next(
                     i
@@ -368,18 +436,20 @@ class BotUI:
                 rows.append(
                     [
                         (
-                            (
-                                "ДЗ"
-                                + (f" #{task['id']}" if self.db.is_admin(uid) else "")
-                                + f" · {label[:48]}"
-                            ),
+                            label[:60],
                             "lesson",
                             {"lid": lesson["id"], "page": task_page},
                         )
                     ]
                 )
             if not tasks:
-                text += "\nДЗ за эту неделю пока не добавлено."
+                text += (
+                    "<blockquote>"
+                    + ("ДЗ за эту неделю пока не добавлено." if saved or lessons else notice)
+                    + "</blockquote>"
+                )
+            if len(tasks) > 5:
+                text += f"<footer>Страница {page + 1} из {(len(tasks) + 4) // 5}</footer>"
             pages = []
             if page:
                 pages.append(
@@ -399,8 +469,11 @@ class BotUI:
                 )
             if pages:
                 rows.append(pages)
+            adjacent = self.adjacent_weeks(gid, monday, today, scope)
+            if adjacent:
+                rows.append(adjacent)
             rows.append([("📅 Дни недели", "week", {"gid": gid, "monday": monday.isoformat()})])
-            await msg.answer(text, reply_markup=self.keyboard(uid, rows))
+            await msg.answer(text, reply_markup=self.keyboard(uid, rows), rich=True)
             return
         if scope in ("today", "tomorrow", "day"):
             lessons = [x for x in lessons if x["day"] == target.isoformat()]
@@ -415,17 +488,20 @@ class BotUI:
             page=page,
             **({"day": target.isoformat()} if scope == "day" else {}),
         )
-        text = f"<b>{escape(self.db.group(gid)['name'])}</b>\n<b>{DAYS[target.weekday()]} · {target:%d.%m.%Y}</b>\n\n📝 — есть ДЗ\n▫️ — ДЗ не добавлено"
+        text = (
+            f"<b>{DAYS[target.weekday()]} · {target:%d.%m.%Y}</b>\n"
+            f"<i>{escape(self.db.group(gid)['name'])}</i>\n\n"
+            "📝 — есть ДЗ\n▫️ — ДЗ не добавлено"
+        )
         if any(not item["active"] for item in lessons):
             text += "\n⚠️ — пара изменилась в расписании"
         rows = []
         for lesson in lessons[page * 8 : page * 8 + 8]:
-            day = date.fromisoformat(lesson["day"])
             prefix = "⚠️" if not lesson["active"] else ("📝" if lesson["hw_count"] else "▫️")
             rows.append(
                 [
                     (
-                        f"{prefix} {day:%d.%m} · {lesson['slot']} · {lesson['subject'][:38]}",
+                        f"{prefix} {lesson['slot']} пара · {lesson['subject']}",
                         "lesson",
                         {"lid": lesson["id"]},
                     )
@@ -473,9 +549,13 @@ class BotUI:
 
     def lesson_title(self, lesson):
         day = date.fromisoformat(lesson["day"])
+        details = clean_details(lesson["details"])[:100]
         return (
-            f"<b>{escape(lesson['subject'][:80])}</b>\n{day:%d.%m.%Y} · {lesson['slot']} пара · "
-            f"{escape(lesson['start'])}–{escape(lesson['finish'])}\n{escape(' '.join(lesson['kind'].split())[:50])}\n{escape(clean_details(lesson['details'])[:100])}"
+            f"<h3>📘 {escape(lesson['subject'][:80])}</h3>"
+            f"<p><b>{DAYS[day.weekday()]} · {day:%d.%m.%Y} · {lesson['slot']} пара</b><br>"
+            f"<i>{escape(lesson['start'])}–{escape(lesson['finish'])} · "
+            f"{escape(' '.join(lesson['kind'].split())[:50])}</i></p>"
+            + (f"<p>📍 {escape(details)}</p>" if details else "")
         )
 
     @staticmethod
@@ -494,45 +574,92 @@ class BotUI:
         chunks.append(current)
         return chunks
 
-    async def show_file(self, msg, uid, text, rows, file_id, file_kind):
-        source = None
-        if file_kind == "photo":
-            source = file_id
-            cached = self.db.one(
-                "SELECT document_id FROM document_cache WHERE source_id=?", (source,)
-            )
-            if cached:
-                file_id = cached["document_id"]
-            else:
-                stream = await msg.bot.download(file_id)
-                file_id = BufferedInputFile(stream.getvalue(), filename="homework-photo.jpg")
-        result = await msg.answer(text, reply_markup=self.keyboard(uid, rows), document=file_id)
-        if source and getattr(result, "document", None):
+    async def document_input(self, msg, file_id, file_kind):
+        if file_kind != "photo":
+            return file_id
+        cached = self.db.one("SELECT document_id FROM document_cache WHERE source_id=?", (file_id,))
+        if cached:
+            return cached["document_id"]
+        stream = await msg.bot.download(file_id)
+        return BufferedInputFile(stream.getvalue(), filename="homework-photo.jpg")
+
+    def remember_document(self, source_id, document):
+        if document is not None:
             self.db.conn.execute(
                 "INSERT OR REPLACE INTO document_cache VALUES(?,?)",
-                (source, result.document.file_id),
+                (source_id, document.file_id),
             )
+
+    async def show_file(self, msg, uid, text, rows, file_id, file_kind):
+        document = await self.document_input(msg, file_id, file_kind)
+        result = await msg.answer(text, reply_markup=self.keyboard(uid, rows), documents=[document])
+        if file_kind == "photo":
+            rich = getattr(result, "rich_message", None)
+            if rich and rich.blocks and rich.blocks[-1].type == "document":
+                self.remember_document(file_id, rich.blocks[-1].document)
         return result
+
+    async def send_files_to_chat(self, msg, files):
+        media_group_limit = 10
+        for start in range(0, len(files), media_group_limit):
+            batch = files[start : start + media_group_limit]
+            photos = [file["file_id"] for file in batch if file["file_kind"] == "photo"]
+            documents = [file["file_id"] for file in batch if file["file_kind"] == "document"]
+            if photos:
+                await msg.bot.send_rich_message(
+                    chat_id=msg.chat.id, rich_message=attachment_message("", documents, photos)
+                )
+                continue
+            if len(documents) == 1:
+                await msg.answer_document(documents[0])
+            else:
+                await msg.answer_media_group(
+                    media=[InputMediaDocument(media=document) for document in documents]
+                )
+
+    async def show_homework(self, msg, uid, text, rows, files):
+        if not files:
+            await msg.answer(text, reply_markup=self.keyboard(uid, rows))
+            return
+        if len(files) == 1 and files[0]["file_kind"] == "document":
+            file = files[0]
+            await self.show_file(msg, uid, text, rows, file["file_id"], file["file_kind"])
+            return
+        documents = [file["file_id"] for file in files if file["file_kind"] == "document"]
+        photos = [file["file_id"] for file in files if file["file_kind"] == "photo"]
+        await msg.answer(
+            text, reply_markup=self.keyboard(uid, rows), documents=documents, photos=photos
+        )
 
     async def lesson(self, msg, uid, lid, page=0, text_page=0):
         lesson = self.db.lesson(uid, lid)
         tasks = self.db.homework(uid, lid)
         page = max(0, min(page, len(tasks) - 1))
         msg.route("lesson", lid=lid, page=page, text_page=text_page)
-        writable = self.db.role(uid, lesson["group_id"]) in ("superadmin", "head", "editor")
+        role = self.db.role(uid, lesson["group_id"])
+        writable = role in ("superadmin", "head", "editor")
         text = self.lesson_title(lesson)
         if not lesson["active"]:
             text += "\n⚠️ Пара исчезла или изменилась в расписании. ДЗ сохранено; старосте нужно проверить привязку."
         rows = []
+        files = []
+        homework_actions = []
+        pages = []
+        materials_target = {"lid": lid}
         if tasks:
             hw = tasks[page]
+            if lesson["active"] and role in ("head", "superadmin"):
+                materials_target["homework_id"] = hw["id"]
+            files = homework_attachments(hw)
             updated = datetime.fromtimestamp(hw["updated"], self.tz).strftime("%d.%m %H:%M")
             identifier = f" · #{hw['id']}" if self.db.is_admin(uid) else ""
-            text += f"\n\n<b>ДЗ {page + 1} из {len(tasks)}{identifier}</b> · {updated}\n\n"
+            text += f"\n\n<b>ДЗ {page + 1} из {len(tasks)}{identifier}</b>\n<i>Обновлено {updated}</i>\n\n"
             # One shared header for text-only homework and attachments; reserve space
             # for Telegram's caption limit, page indicator and save confirmation.
             header_units = len(unescape(re.sub(r"<[^>]+>", "", text)).encode("utf-16-le")) // 2
-            limit = max(1, min(600, 1024 - header_units - 100)) if hw["file_id"] else 2400
+            limit = 6000 if files else 2400
+            if len(files) == 1 and files[0]["file_kind"] == "document":
+                limit = max(1, min(600, 1024 - header_units - 100))
             chunks = self.text_chunks(hw["body"] or "Задание во вложении.", limit)
             text_page = max(0, min(text_page, len(chunks) - 1))
             msg.route("lesson", lid=lid, page=page, text_page=text_page)
@@ -545,7 +672,11 @@ class BotUI:
                         (
                             "← Текст",
                             "lesson",
-                            {"lid": lid, "page": page, "text_page": text_page - 1},
+                            {
+                                "lid": lid,
+                                "page": page,
+                                "text_page": text_page - 1,
+                            },
                         )
                     )
                 if text_page + 1 < len(chunks):
@@ -553,44 +684,294 @@ class BotUI:
                         (
                             "Текст →",
                             "lesson",
-                            {"lid": lid, "page": page, "text_page": text_page + 1},
+                            {
+                                "lid": lid,
+                                "page": page,
+                                "text_page": text_page + 1,
+                            },
                         )
                     )
                 rows.append(controls)
-            if hw["file_id"]:
-                rows.append([("📎 Прислать вложенный файл", "send_attachment", {"hid": hw["id"]})])
-            if writable:
-                edits = (
-                    [("✏️ Изменить", "write", {"lid": lid, "hid": hw["id"]})]
-                    if lesson["active"]
-                    else []
-                )
-                if lesson["active"] and not hw["file_id"]:
-                    edits.append(
+            if files:
+                rows.append(
+                    [
                         (
-                            "📎 Прикрепить файл",
-                            "write",
-                            {"lid": lid, "hid": hw["id"], "attach": True},
-                        )
-                    )
-                rows.append(edits + [("🗑 Удалить", "delete", {"hid": hw["id"]})])
-            pages = []
+                            "📎 Прислать файлы в чат",
+                            "send_attachment",
+                            {"hid": hw["id"], "revision": hw["revision"]},
+                        ),
+                    ]
+                )
+            if writable:
+                homework_actions.append(("✏️ Редактировать", "edit_homework", {"hid": hw["id"]}))
             if page:
                 pages.append(("← ДЗ", "lesson", {"lid": lid, "page": page - 1}))
             if page + 1 < len(tasks):
                 pages.append(("ДЗ →", "lesson", {"lid": lid, "page": page + 1}))
-            if pages:
-                rows.append(pages)
         else:
             text += "\n\nДЗ пока не добавлено."
         if writable and lesson["active"]:
-            rows.append([("➕ Добавить ДЗ", "write", {"lid": lid})])
-        if tasks and tasks[page]["file_id"]:
-            await self.show_file(
-                msg, uid, text, rows, tasks[page]["file_id"], tasks[page]["file_kind"]
+            homework_actions.append(("➕ Добавить ДЗ", "write", {"lid": lid}))
+        if homework_actions:
+            rows.append(homework_actions)
+        if pages:
+            rows.append(pages)
+        rows.insert(1, [("📚 Материалы курса", "materials", materials_target)])
+        await self.show_homework(msg, uid, text, rows, files)
+
+    def material_draft(self, msg, uid, lid, draft_id):
+        draft = self.db.session_get(uid)
+        if not draft or (draft.get("draft_id"), draft.get("lid"), draft.get("screen_id")) != (
+            draft_id,
+            lid,
+            msg.message_id,
+        ):
+            raise UserError("Черновик устарел. Откройте добавление ДЗ заново.")
+        self.db.lesson(uid, lid, "manage")
+        return draft
+
+    async def materials(
+        self, msg, uid, lid=None, hid=None, page=0, draft_id=None, homework_id=None, remove=False
+    ):
+        route = "materials"
+        draft = None
+        if draft_id:
+            draft = self.material_draft(msg, uid, lid, draft_id)
+            target = {"lid": lid, "draft_id": draft_id}
+            route = "draft_materials"
+        elif hid is None:
+            target = {"lid": lid}
+            if homework_id is not None:
+                target["homework_id"] = homework_id
+            if remove:
+                target["remove"] = True
+        else:
+            homework = self.db.homework_item(uid, hid, "manage")
+            lid = homework["lesson_id"]
+            target = {"hid": hid}
+        lesson = self.db.lesson(uid, lid, "manage" if remove else "read")
+        can_manage = self.db.role(uid, lesson["group_id"]) in ("head", "superadmin")
+        files = self.db.subject_materials(uid, lid)
+        title = "Материалы курса"
+        attached = set()
+        if remove:
+            title = "Удалить материал"
+        elif draft or hid is not None:
+            title = "Файл из материалов"
+            attached = {file["file_id"] for file in homework_attachments(draft or homework)}
+        page_size = 8
+        page = max(0, min(page, (len(files) - 1) // page_size))
+        msg.route(route, **target, page=page)
+        rows = []
+        for file in files[page * page_size : (page + 1) * page_size]:
+            selection = {**target, "material_id": file["id"]}
+            if remove:
+                action = "confirm_material_delete"
+                selection = {"lid": lid, "material_id": file["id"]}
+                icon = "📄"
+            elif not draft and hid is None:
+                action = "send_materials"
+                icon = "📄"
+            else:
+                is_attached = file["file_id"] in attached
+                icon = "✅" if is_attached else "▫️"
+                selection["page"] = page
+                if draft:
+                    action = "draft_material"
+                    selection["detach"] = is_attached
+                else:
+                    action = "detach_material" if is_attached else "attach_material"
+                    selection["revision"] = homework["revision"]
+            rows.append([(f"{icon} {file['name'][:60]}", action, selection)])
+        paging = []
+        if page:
+            paging.append(("←", route, {**target, "page": page - 1}))
+        if (page + 1) * page_size < len(files):
+            paging.append(("→", route, {**target, "page": page + 1}))
+        if paging:
+            rows.append(paging)
+        text = f"<b>{title} · {escape(lesson['subject'][:100])}</b>"
+        if files:
+            text += f"\n<i>Файлов: {len(files)}</i>"
+        if not files:
+            text += "\n\nМатериалов пока нет."
+        elif remove:
+            text += "\n\nВыберите файл."
+        elif hid is None and not draft:
+            file_actions = []
+            if (
+                homework_id is not None
+                and lesson["active"]
+                and can_manage
+                and any(task["id"] == homework_id for task in self.db.homework(uid, lid))
+            ):
+                file_actions.append(("📎 Добавить к ДЗ", "materials", {"hid": homework_id}))
+            file_actions.append(("📤 Все в чат", "send_materials", {"lid": lid}))
+            rows.append(file_actions)
+        else:
+            text += "\n\n✅ В ДЗ — нажмите, чтобы открепить\n▫️ Нажмите, чтобы прикрепить"
+            if len(attached) >= MAX_ATTACHMENTS:
+                text += f"\nДостигнут лимит: {MAX_ATTACHMENTS} файлов на ДЗ."
+        if can_manage and not (draft or hid is not None or remove):
+            manage_actions = [("➕ Загрузить", "upload_materials", {"lid": lid})]
+            if files:
+                manage_actions.append(("🗑 Удалить", "materials", {**target, "remove": True}))
+            rows.append(manage_actions)
+        if draft:
+            self.db.session_clear(uid)
+            self.db.session_set(uid, draft)
+            await msg.answer(
+                text, reply_markup=self.keyboard(uid, rows), back_label="⬅️ К черновику"
             )
+            msg.bind_input()
         else:
             await msg.answer(text, reply_markup=self.keyboard(uid, rows))
+
+    async def upload_materials(self, msg, uid, lid):
+        lesson = self.db.lesson(uid, lid, "manage")
+        msg.route("upload_materials", lid=lid)
+        self.db.session_set(uid, {"state": "upload_materials", "lid": lid})
+        await msg.answer(
+            f"<b>Загрузить файлы · {escape(lesson['subject'][:100])}</b>\n\n"
+            "Пришлите документы или фото. Каждый файл сразу появится в материалах. "
+            "Для фото можно указать название в подписи. Кнопка «Назад» вернёт вас к списку.",
+            reply_markup=self.keyboard(uid, []),
+        )
+        msg.bind_input()
+
+    async def confirm_material_delete(self, msg, uid, lid, material_id):
+        material = self.db.subject_material(uid, lid, material_id, "manage")
+        msg.route("confirm_material_delete", lid=lid, material_id=material_id)
+        rows = [
+            [
+                (
+                    "🗑 Удалить из материалов",
+                    "delete_material",
+                    {"lid": lid, "material_id": material_id},
+                )
+            ]
+        ]
+        await msg.answer(
+            "<b>Удалить материал?</b>\n\n"
+            f"<blockquote>{escape(material['name'][:200])}</blockquote>\n"
+            "<i>Вложения в ДЗ сохранятся.</i>",
+            reply_markup=self.keyboard(uid, rows),
+        )
+
+    async def change_draft_material(self, msg, uid, lid, draft_id, material_id, detach, page):
+        draft = self.material_draft(msg, uid, lid, draft_id)
+        if not msg.current or msg.current["action"] != "draft_materials":
+            raise UserError("Откройте «Из материалов» в черновике.")
+        material = self.db.subject_material(uid, lid, material_id)
+        files = homework_attachments(draft)
+        other_files = [file for file in files if file["file_id"] != material["file_id"]]
+        if detach:
+            files = other_files
+        elif len(other_files) == len(files):
+            if len(files) >= MAX_ATTACHMENTS:
+                raise UserError(f"К одному ДЗ можно прикрепить до {MAX_ATTACHMENTS} файлов.")
+            files.append({key: material[key] for key in ("file_id", "file_kind", "name")})
+        draft.update(attachments=files, state="preview" if files or draft["body"] else "write")
+        self.db.session_set(uid, draft)
+        await self.materials(msg, uid, lid=lid, draft_id=draft_id, page=page)
+
+    async def edit_homework(self, msg, uid, hid):
+        homework = self.db.homework_item(uid, hid, "write")
+        lesson = self.db.lesson(uid, homework["lesson_id"])
+        msg.route("edit_homework", hid=hid)
+        rows = []
+        if lesson["active"]:
+            target = {"lid": lesson["id"], "hid": hid}
+            rows = [
+                [
+                    ("➕ Дописать текст", "write", {**target, "description_mode": "append"}),
+                    ("🔄 Заменить текст", "write", {**target, "description_mode": "replace"}),
+                ],
+                [("📎 Редактировать файлы", "edit_files", {"hid": hid})],
+            ]
+        rows.append([("🗑 Удалить ДЗ", "delete", {"hid": hid})])
+        await msg.answer("<b>Редактировать ДЗ</b>", reply_markup=self.keyboard(uid, rows))
+
+    async def edit_files(self, msg, uid, hid):
+        homework = self.db.homework_item(uid, hid, "write")
+        files = homework_attachments(homework)
+        msg.route("edit_files", hid=hid)
+        rows = [
+            [
+                (
+                    f"📄 {attachment_name(file, index)[:60]}",
+                    "edit_file",
+                    {"hid": hid, "index": index, "revision": homework["revision"]},
+                )
+            ]
+            for index, file in enumerate(files)
+        ]
+        if len(files) < MAX_ATTACHMENTS:
+            rows.append(
+                [
+                    (
+                        "➕ Добавить файл",
+                        "write",
+                        {"lid": homework["lesson_id"], "hid": hid, "attach": True},
+                    )
+                ]
+            )
+        text = f"<b>Редактировать файлы</b>\n<i>Вложений: {len(files)} из {MAX_ATTACHMENTS}</i>"
+        await msg.answer(text, reply_markup=self.keyboard(uid, rows))
+
+    def file_for_edit(self, uid, hid, index, revision):
+        homework, files = self.db.homework_files_for_edit(uid, hid, revision)
+        if not 0 <= index < len(files):
+            raise UserError("Список файлов изменился. Откройте его заново.")
+        return homework, files
+
+    async def edit_file(self, msg, uid, hid, index, revision):
+        homework, files = self.file_for_edit(uid, hid, index, revision)
+        file = files[index]
+        msg.route("edit_file", hid=hid, index=index, revision=revision)
+        rows = [
+            [
+                (
+                    "🗑 Удалить файл",
+                    "confirm_file_delete",
+                    {"hid": hid, "index": index, "revision": revision},
+                )
+            ]
+        ]
+        lesson = self.db.lesson(uid, homework["lesson_id"])
+        if self.db.role(uid, lesson["group_id"]) in ("head", "superadmin"):
+            rows.insert(
+                0,
+                [
+                    (
+                        "📎 Добавить в материалы",
+                        "save_material",
+                        {"hid": hid, "index": index, "revision": revision},
+                    )
+                ],
+            )
+        await self.show_file(
+            msg,
+            uid,
+            f"<b>{escape(attachment_name(file, index)[:200])}</b>",
+            rows,
+            file["file_id"],
+            file["file_kind"],
+        )
+
+    async def confirm_file_delete(self, msg, uid, hid, index, revision):
+        homework, files = self.file_for_edit(uid, hid, index, revision)
+        msg.route("confirm_file_delete", hid=hid, index=index, revision=revision)
+        text = (
+            "<b>Удалить файл?</b>\n\n"
+            f"<blockquote>{escape(attachment_name(files[index], index)[:200])}</blockquote>"
+        )
+        if len(files) == 1 and not homework["body"].strip():
+            text += "\n<b>Это единственный файл в ДЗ без текста.</b> При подтверждении задание будет удалено."
+        rows = [
+            [("Да, удалить", "delete_file", {"hid": hid, "index": index, "revision": revision})]
+        ]
+        await msg.answer(text, reply_markup=self.keyboard(uid, rows))
 
     async def members(self, msg, uid, gid, page=0):
         members = self.db.members(uid, gid)
@@ -601,7 +982,10 @@ class BotUI:
             text += "\n<blockquote>ℹ️ В группе пока нет участников.</blockquote>\n"
         for user in members[page * 8 : page * 8 + 8]:
             username = "@" + user["username"] if user["username"] else "без username"
-            text += f"\n{escape(user['name'])} · {escape(username)}\n<code>{user['id']}</code> · {ROLES[user['role']]}\n"
+            text += (
+                f"\n<b>{escape(user['name'])}</b> · {escape(username)}\n"
+                f"<code>{user['id']}</code> · <i>{ROLES[user['role']]}</i>\n"
+            )
         rows = [
             [
                 ("➕ Добавить", "person", {"operation": "add", "gid": gid}),
@@ -657,7 +1041,9 @@ class BotUI:
             raise UserError("Недостаточно прав для снятия полномочий старосты.")
         msg.route("remove_member", gid=gid, target=target)
         await msg.answer(
-            f"Удалить из группы <b>{escape(person['name'])}</b>?\nID: <code>{target}</code>\nДоступ к группе будет закрыт."
+            "<b>Удалить из группы?</b>\n\n"
+            f"<b>{escape(person['name'])}</b>\nID: <code>{target}</code>\n\n"
+            "<b>Доступ к группе будет закрыт.</b>"
             + (
                 "\nПолномочия старосты и созданные им ожидающие приглашения будут отменены."
                 if person["role"] == "head"
@@ -684,7 +1070,7 @@ class BotUI:
         text = (
             "<b>Ожидают первого входа</b>\n"
             + escape(self.db.group(gid)["name"])
-            + "\nПривязки действуют 30 дней. Нажмите имя, чтобы отменить ожидание.\n"
+            + "\n<i>Привязки действуют 30 дней.</i>\nНажмите имя, чтобы отменить ожидание.\n"
         )
         rows = []
         for person in people[page * 8 : page * 8 + 8]:
@@ -706,7 +1092,10 @@ class BotUI:
         if not users:
             text += "\n<blockquote>ℹ️ Назначенных старост пока нет.</blockquote>\n"
         for user in users[page * 8 : page * 8 + 8]:
-            text += f"\n{escape(user['name'])} · <code>{user['id']}</code>\n{escape(user['group_name'] or 'Группа ещё не выбрана')}\n"
+            text += (
+                f"\n<b>{escape(user['name'])}</b> · <code>{user['id']}</code>\n"
+                f"<i>{escape(user['group_name'] or 'Группа ещё не выбрана')}</i>\n"
+            )
         rows = [
             [
                 ("Назначить", "person", {"operation": "appoint"}),
@@ -746,7 +1135,8 @@ class BotUI:
             raise UserError("Полномочия этого старосты уже сняты. Обновите список.")
         msg.route("revoke_head", target=target)
         await msg.answer(
-            f"Снять полномочия старосты у <b>{escape(person['name'])}</b>?\nID: <code>{target}</code>\n"
+            "<b>Снять полномочия старосты?</b>\n\n"
+            f"<b>{escape(person['name'])}</b>\nID: <code>{target}</code>\n\n"
             + (
                 "Он останется студентом своей группы."
                 if person["group_name"]
@@ -780,12 +1170,13 @@ class BotUI:
         msg.route("person", operation=operation, gid=gid)
         self.db.session_set(uid, {"state": "person", "operation": operation, "gid": gid})
         await msg.answer(
-            (
+            "<b>Добавить участников</b>\n\n"
+            + (
                 "Отправьте @username одногруппников списком: через пробел, запятую или с новой строки (до 100). Можно добавить людей до первого запуска бота. Либо отправьте один числовой ID."
                 if operation == "add"
                 else "Отправьте @username или числовой ID зарегистрированного пользователя."
             )
-            + "\n\nКнопка «Назад» или /cancel — отменить.",
+            + "\n\n<i>Кнопка «Назад» или /cancel — отменить.</i>",
             reply_markup=self.keyboard(uid, []),
         )
         msg.bind_input()
@@ -895,42 +1286,93 @@ class BotUI:
         route = msg.return_to("members", gid=gid) if gid else msg.return_to("heads")
         await self.render(msg, uid, route)
 
-    async def write(self, msg, uid, lid, hid=None, attach=False):
-        self.db.lesson(uid, lid, "write")
+    async def write(self, msg, uid, lid, hid=None, attach=False, description_mode=None):
+        lesson = self.db.lesson(uid, lid, "write")
         hw = self.db.homework_item(uid, hid, "write") if hid else None
         if hw and hw["lesson_id"] != lid:
             raise UserError("Задание относится к другой паре.")
         if attach and hw is None:
             raise UserError("Сначала выберите существующее ДЗ.")
-        msg.route("write", lid=lid, hid=hid, attach=attach)
-        self.db.session_set(
-            uid,
-            {
-                "state": "write",
-                "lid": lid,
-                "hid": hid,
-                "revision": hw["revision"] if hw else None,
-                "body": hw["body"] if hw else "",
-                "file_id": hw["file_id"] if hw else None,
-                "file_kind": hw["file_kind"] if hw else None,
-                "attach": attach,
-            },
-        )
+        if hw and not attach and description_mode is None:
+            await self.edit_homework(msg, uid, hid)
+            return
+        msg.route("write", lid=lid, hid=hid, attach=attach, description_mode=description_mode)
+        draft = {
+            "state": "write",
+            "lid": lid,
+            "hid": hid,
+            "revision": hw["revision"] if hw else None,
+            "body": hw["body"] if hw and description_mode != "replace" else "",
+            "attachments": homework_attachments(hw) if hw else [],
+            "replace_description": description_mode == "replace",
+        }
+        if hw is None and self.db.role(uid, lesson["group_id"]) in ("head", "superadmin"):
+            draft["draft_id"] = uuid4().hex
+        self.db.session_set(uid, draft)
+        if description_mode:
+            await self.homework_preview(msg, uid, lesson, draft)
+            return
+        if attach:
+            prompt = (
+                "Пришлите файл или фото. Если добавите подпись, она дополнит описание."
+                "\nОтправляйте текст и файлы по очереди. Они попадут в один черновик.\n"
+                "\nКогда всё готово, нажмите <b>«Сохранить ДЗ»</b>.\n"
+                f"<i>До 3000 символов и {MAX_ATTACHMENTS} файлов на задание.</i>\n"
+                "Кнопка «Назад» или /cancel — отменить."
+            )
+        else:
+            prompt = (
+                "<b>📝 Пришлите задание</b>\n\n"
+                "✏️ Текст\n"
+                "📎 Файлы\n"
+                "🖼 Фото или альбом\n\n"
+                "Можно отправить несколько сообщений — всё соберётся <b>в одно ДЗ</b>. "
+                "Подписи к вложениям станут частью описания.\n\n"
+                "Готово? Нажмите <b>«Сохранить ДЗ»</b>.\n\n"
+                f"<i>3000 символов · {MAX_ATTACHMENTS} файлов</i>\n"
+                "<i>«Назад» или /cancel — отменить.</i>"
+            )
         await msg.answer(
-            (
-                "Пришлите файл или фото к этому заданию — текст сохранится.\n"
-                if attach
-                else "Отправьте текст и файл/фото с подписью одним сообщением или по отдельности. Я объединю их в одно ДЗ.\n"
-            )
-            + (
-                "При редактировании первый новый текст заменяет старый, вложение сохраняется, если не прислано новое.\n"
-                if hw and not attach
-                else ""
-            )
-            + "До сохранения можно досылать текст — он дополнит черновик. Новое вложение заменит предыдущее.\n"
-            + "Когда всё готово, нажмите «Сохранить ДЗ». До 3000 символов и один файл на задание. Альбомы не поддерживаются.\nКнопка «Назад» или /cancel — отменить.",
-            reply_markup=self.keyboard(uid, []),
+            prompt,
+            reply_markup=self.keyboard(uid, self.draft_material_buttons(draft)),
         )
+        msg.bind_input()
+
+    @staticmethod
+    def draft_material_buttons(draft):
+        if not draft.get("draft_id"):
+            return []
+        target = {"lid": draft["lid"], "draft_id": draft["draft_id"]}
+        return [[("📚 Из материалов", "draft_materials", target)]]
+
+    async def homework_preview(self, msg, uid, lesson, draft):
+        body, files = draft["body"], draft["attachments"]
+        awaiting_description = draft["replace_description"]
+        rows = self.draft_material_buttons(draft)
+        if draft["state"] == "preview" and not awaiting_description:
+            # The button stores the immutable draft shown in this preview.
+            confirm = {k: draft[k] for k in ("lid", "hid", "revision", "body", "attachments")}
+            rows.insert(0, [("✅ Сохранить ДЗ", "save", confirm)])
+        heading = (
+            f"<b>Предпросмотр ДЗ · файлов: {len(files)}</b>" if files else "<b>Предпросмотр ДЗ</b>"
+        )
+        title = escape(lesson["subject"][:80]) if files else self.lesson_title(lesson)
+        text = f"{heading}\n{title}"
+        if body and not awaiting_description:
+            limit = 6000 if files else 1000
+            if len(files) == 1 and files[0]["file_kind"] == "document":
+                limit = 600
+            chunks = self.text_chunks(body, limit)
+            text += f"\n\n<blockquote>{escape(chunks[0])}</blockquote>"
+            if len(chunks) > 1:
+                text += "\n… Полный текст будет сохранён."
+        if awaiting_description:
+            text += "\n\nПришлите новое описание текстом или подписью к файлу."
+        elif draft["state"] == "write":
+            text += "\n\nПришлите текст или файл, чтобы дополнить ДЗ."
+        else:
+            text += "\n\nМожно дослать текст или файл, затем сохранить ДЗ."
+        await self.show_homework(msg, uid, text, rows, files)
         msg.bind_input()
 
     async def help(self, msg, uid):
@@ -939,10 +1381,10 @@ class BotUI:
         if not self.db.is_admin(uid) and (not member or member["role"] != "head"):
             await msg.answer(
                 "<b>Как найти ДЗ</b>\n\n"
-                "Откройте «Моя группа» → «Расписание и ДЗ» → неделю → день → пару.\n\n"
+                "В меню группы нажмите «Выбрать неделю», затем выберите неделю, день и пару.\n\n"
                 "📝 — есть ДЗ\n▫️ — ДЗ не добавлено\n\n"
-                "«Сегодня» и «Завтра» открывают день сразу. «Только ДЗ» показывает задания на неделю.\n"
-                "Переключайтесь стрелками, возвращайтесь кнопкой «Назад». Вложение можно получить через «Прислать вложенный файл».\n\n"
+                "«Сегодня» и «Завтра» открывают день сразу. «Все ДЗ за неделю» показывает задания на текущую неделю.\n"
+                "Переключайтесь стрелками, возвращайтесь кнопкой «Назад». Вложения можно получить кнопкой «Прислать файлы в чат».\n\n"
                 "/start — главное меню",
                 reply_markup=self.keyboard(uid, []),
             )
@@ -959,7 +1401,7 @@ class BotUI:
             reply_markup=self.keyboard(uid, []),
         )
 
-    async def message(self, msg: Message):
+    async def message(self, msg: Message, album=None):
         uid = msg.from_user.id
         state = self.db.session_get(uid)
         msg = Screen(msg, self.db, uid, message_id=state.get("screen_id") if state else None)
@@ -972,7 +1414,7 @@ class BotUI:
         if command == "/cancel":
             self.db.session_clear(uid)
             # Leave the whole input flow, including its preview.
-            while msg.history and msg.history[-1]["action"] in ("write", "person"):
+            while msg.history and msg.history[-1]["action"] in ("write", "preview", "person"):
                 msg.history.pop()
             await self.render(msg, uid, msg.back())
             return
@@ -988,6 +1430,30 @@ class BotUI:
         state = self.db.session_get(uid)
         if not state:
             await self.home(msg, uid)
+            return
+        if state["state"] == "upload_materials":
+            if msg.document:
+                file = {
+                    "file_id": msg.document.file_id,
+                    "file_kind": "document",
+                    "name": msg.document.file_name or f"Файл {msg.message_id}",
+                }
+            elif msg.photo:
+                caption = " ".join((msg.caption or "").split())
+                file = {
+                    "file_id": msg.photo[-1].file_id,
+                    "file_kind": "photo",
+                    "name": caption[:120] or f"Фото {msg.message_id}.jpg",
+                }
+            else:
+                raise UserError("Пришлите документ или фото.")
+            saved = self.db.upload_subject_material(uid, state["lid"], file)
+            msg.notice = (
+                f"✅ Добавлено: {escape(file['name'][:120])}."
+                if saved
+                else "Этот файл уже есть в материалах."
+            )
+            await self.upload_materials(msg, uid, state["lid"])
             return
         if state["state"] == "person":
             self.check_person_action(uid, state["operation"], state["gid"])
@@ -1038,75 +1504,52 @@ class BotUI:
             msg.bind_input()
             return
         if state["state"] in ("write", "preview"):
-            self.db.lesson(uid, state["lid"], "write")
-            if msg.media_group_id:
-                raise UserError("Отправьте один файл без альбома. /cancel — отменить.")
-            file_kind = "photo" if msg.photo else ("document" if msg.document else None)
-            file_id = (
-                msg.photo[-1].file_id
-                if msg.photo
-                else (msg.document.file_id if msg.document else None)
-            )
-            incoming = (msg.text or msg.caption or "").strip()
-            if not (incoming or file_id):
-                raise UserError("Нужен текст, фото или документ.")
-            previous = state.get("body", "")
-            if incoming:
-                body = (
-                    (previous + "\n\n" + incoming).strip()
-                    if previous and (state["state"] == "preview" or state.get("attach"))
-                    else incoming
+            lesson = self.db.lesson(uid, state["lid"], "write")
+            body = state.get("body", "")
+            files = homework_attachments(state)
+            replace_description = state.get("replace_description", False)
+            for item in album or [msg]:
+                file_kind = "photo" if item.photo else ("document" if item.document else None)
+                file_id = (
+                    item.photo[-1].file_id
+                    if item.photo
+                    else (item.document.file_id if item.document else None)
                 )
-            else:
-                body = previous
+                incoming = (item.text or item.caption or "").strip()
+                if not (incoming or file_id):
+                    raise UserError("Нужен текст, фото или документ.")
+                if incoming:
+                    body = f"{body}\n\n{incoming}" if body and not replace_description else incoming
+                    replace_description = False
+                if file_id:
+                    file = {"file_id": file_id, "file_kind": file_kind}
+                    if item.document and item.document.file_name:
+                        file["name"] = item.document.file_name
+                    if not any(existing["file_id"] == file_id for existing in files):
+                        files = [*files, file]
             if len(body) > 3000:
                 raise UserError(
                     "Общий текст ДЗ должен быть не длиннее 3000 символов. Черновик сохранён без последнего сообщения."
                 )
-            file_id = file_id or state.get("file_id")
-            file_kind = file_kind or state.get("file_kind")
+            if len(files) > MAX_ATTACHMENTS:
+                raise UserError(
+                    f"К одному ДЗ можно прикрепить до {MAX_ATTACHMENTS} файлов. "
+                    "Черновик сохранён без последних вложений."
+                )
             self.db.session_clear(uid)
             payload = {
                 **state,
                 "state": "preview",
                 "body": body,
-                "file_id": file_id,
-                "file_kind": file_kind,
+                "attachments": files,
+                "replace_description": replace_description,
             }
             self.db.session_set(uid, payload)
-            # Token stores the full immutable draft; don't accidentally publish a newer draft from an older button.
-            confirm = {
-                k: payload[k] for k in ("lid", "hid", "revision", "body", "file_id", "file_kind")
-            }
-            lesson = self.db.lesson(uid, state["lid"])
-            msg.route("preview")
-            rows = [[("✅ Сохранить ДЗ", "save", confirm)]]
-            if file_id:
-                caption = (
-                    "<b>Предпросмотр ДЗ</b>\n"
-                    + escape(lesson["subject"][:80])
-                    + "\n\n"
-                    + "<blockquote>"
-                    + escape(self.text_chunks(body or "Задание во вложении.", 600)[0])
-                    + "</blockquote>"
-                )
-                if len(self.text_chunks(body or "", 600)) > 1:
-                    caption += "\n… Полный текст сохранится и будет доступен по страницам."
-                caption += "\n\nМожно дослать текст или файл, затем сохранить ДЗ."
-                await self.show_file(msg, uid, caption, rows, file_id, file_kind)
-            else:
-                await msg.answer(
-                    "<b>Предпросмотр ДЗ</b>\n"
-                    + self.lesson_title(lesson)
-                    + "\n\n"
-                    + "<blockquote>"
-                    + escape(body[:1000])
-                    + "</blockquote>"
-                    + ("\n… Полный текст будет сохранён." if len(body) > 1000 else "")
-                    + "\n\nМожно дослать файл, фото или дополнительный текст. Затем нажмите «Сохранить ДЗ».",
-                    reply_markup=self.keyboard(uid, rows),
-                )
-            msg.bind_input()
+            if msg.current and msg.current["action"] == "draft_materials":
+                msg.back()
+            if not (msg.current and msg.current.get("description_mode")):
+                msg.route("preview")
+            await self.homework_preview(msg, uid, lesson, payload)
             return
         await msg.message.answer(
             "Подтвердите сохранение кнопкой под предпросмотром или отправьте /cancel."
@@ -1144,6 +1587,14 @@ class BotUI:
             "week": self.week,
             "weeks": self.weeks,
             "lesson": self.lesson,
+            "materials": self.materials,
+            "upload_materials": self.upload_materials,
+            "confirm_material_delete": self.confirm_material_delete,
+            "edit_homework": self.edit_homework,
+            "edit_description": self.edit_homework,  # Route saved before the menus were merged.
+            "edit_files": self.edit_files,
+            "edit_file": self.edit_file,
+            "confirm_file_delete": self.confirm_file_delete,
             "members": self.members,
             "pending": self.pending,
             "remove_members": self.remove_members,
@@ -1160,6 +1611,8 @@ class BotUI:
         }
         if action not in views:
             raise UserError("Кнопка устарела. Откройте /start.")
+        if action == "lesson":
+            payload.pop("file_page", None)  # Cards sent before all files were shown together.
         await views[action](msg, uid, **payload)
 
     async def callback(self, query: CallbackQuery):
@@ -1167,16 +1620,33 @@ class BotUI:
         uid = query.from_user.id
         payload = self.db.token_get(uid, query.data or "")
         action = payload.pop("action")
+        if action == "open_material":  # Buttons from previously displayed lists.
+            action = "send_materials"
         msg = Screen(query.message, self.db, uid, message_id=query.message.message_id)
+        if action == "back" and msg.current and msg.current["action"] == "draft_materials":
+            lid, draft_id = msg.current["lid"], msg.current["draft_id"]
+            draft = self.material_draft(msg, uid, lid, draft_id)
+            msg.back()
+            msg.route("preview")
+            await self.homework_preview(msg, uid, self.db.lesson(uid, lid), draft)
+            return
         if action not in (
             "save",
             "person_confirm",
             "bulk_confirm",
             "attachment",
             "send_attachment",
+            "send_materials",
+            "draft_materials",
+            "draft_material",
         ):
             self.db.session_clear(uid)
-        if action == "back":
+        if action == "draft_materials":
+            await self.materials(msg, uid, **payload)
+        elif action == "draft_material":
+            await self.change_draft_material(msg, uid, **payload)
+            self.db.token_delete(query.data)
+        elif action == "back":
             await self.render(msg, uid, msg.back())
         elif action == "person_confirm":
             await self.person_confirm(msg, uid, **payload)
@@ -1198,37 +1668,70 @@ class BotUI:
         elif action == "claim":
             self.db.claim(uid, payload["gid"])
             self.db.token_delete(query.data)
-            # After claiming, the catalogue is no longer available to this head.
-            msg.current, msg.history = None, []
             await self.group(msg, uid, payload["gid"])
         elif action == "save":
             hid = self.db.save_homework(uid, **payload, token=query.data)
             self.db.session_clear(uid)
+            msg.notice = "✅ ДЗ сохранено."
+            if any(
+                route["action"] == "edit_files" and route["hid"] == hid for route in msg.history
+            ):
+                await self.render(msg, uid, msg.return_to("edit_files", hid=hid))
+                return
             tasks = self.db.homework(uid, payload["lid"])
             page = next(i for i, task in enumerate(tasks) if task["id"] == hid)
-            msg.notice = "✅ ДЗ сохранено."
             route = msg.return_to("lesson", lid=payload["lid"])
             await self.render(msg, uid, {**route, "page": page})
+        elif action == "save_material":
+            saved = self.db.save_subject_material(uid, **payload)
+            msg.notice = "✅ Файл добавлен в материалы." if saved else "Файл уже есть в материалах."
+            await self.edit_file(msg, uid, **payload)
+        elif action == "delete_material":
+            self.db.delete_subject_material(uid, **payload)
+            self.db.token_delete(query.data)
+            msg.notice = "✅ Файл удалён из материалов."
+            await self.render(msg, uid, msg.return_to("materials", lid=payload["lid"], remove=True))
+        elif action in ("attach_material", "detach_material"):
+            page = payload.pop("page", 0)
+            detach = action == "detach_material"
+            self.db.set_subject_material_attachment(uid, **payload, detach=detach)
+            msg.notice = "Файл откреплён от ДЗ." if detach else "✅ Файл прикреплён к ДЗ."
+            await self.materials(msg, uid, hid=payload["hid"], page=page)
+        elif action == "delete_file":
+            hid, index, revision = payload["hid"], payload["index"], payload["revision"]
+            homework, files = self.file_for_edit(uid, hid, index, revision)
+            remaining = files[:index] + files[index + 1 :]
+            if not remaining and not homework["body"].strip():
+                self.db.delete_homework(uid, hid, revision)
+                msg.notice = "✅ ДЗ удалено."
+                await self.render(msg, uid, msg.return_to("lesson", lid=homework["lesson_id"]))
+            else:
+                self.db.save_homework(
+                    uid,
+                    homework["lesson_id"],
+                    homework["body"],
+                    hid=hid,
+                    revision=revision,
+                    attachments=remaining,
+                )
+                msg.notice = "✅ Файл удалён."
+                await self.render(msg, uid, msg.return_to("edit_files", hid=hid))
         elif action == "send_attachment":
             hw = self.db.homework_item(uid, payload["hid"])
-            if not hw["file_id"]:
-                raise UserError("У этого задания нет вложения.")
-            file_id = hw["file_id"]
-            if hw["file_kind"] == "photo":
-                cached = self.db.one(
-                    "SELECT document_id FROM document_cache WHERE source_id=?", (file_id,)
-                )
-                if cached:
-                    file_id = cached["document_id"]
-                else:
-                    stream = await msg.bot.download(file_id)
-                    file_id = BufferedInputFile(stream.getvalue(), filename="homework-photo.jpg")
-            sent = await msg.answer_document(file_id)
-            if hw["file_kind"] == "photo" and getattr(sent, "document", None):
-                self.db.conn.execute(
-                    "INSERT OR REPLACE INTO document_cache VALUES(?,?)",
-                    (hw["file_id"], sent.document.file_id),
-                )
+            files = homework_attachments(hw)
+            if payload.get("revision", hw["revision"]) != hw["revision"] or not files:
+                raise UserError("Вложения изменились. Откройте задание заново.")
+            await self.send_files_to_chat(msg, files)
+        elif action == "send_materials":
+            lid, material_id = payload["lid"], payload.get("material_id")
+            files = (
+                self.db.subject_materials(uid, lid)
+                if material_id is None
+                else [self.db.subject_material(uid, lid, material_id)]
+            )
+            if not files:
+                raise UserError("Материалов пока нет.")
+            await self.send_files_to_chat(msg, files)
         elif action == "attachment":
             hw = self.db.homework_item(uid, payload["hid"])
             tasks = self.db.homework(uid, hw["lesson_id"])
@@ -1248,6 +1751,7 @@ def build_dispatcher(store, schedule, settings, refresher=None):
     ui = BotUI(store, schedule, settings, refresher)
     router = Router()
     middleware = PrivateAccess(store)
+    router.message.outer_middleware(HomeworkAlbums(store))
     router.message.outer_middleware(middleware)
     router.callback_query.outer_middleware(middleware)
     router.message.register(ui.message)

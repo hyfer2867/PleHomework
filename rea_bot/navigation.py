@@ -1,7 +1,39 @@
 """Editable Telegram screens with per-message, persistent navigation history."""
 
+import re
+
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputRichMessage,
+    InputRichMessageMedia,
+)
+
+
+def attachment_message(text, documents=None, photos=None):
+    text = re.sub(r"\A<b>(.*?)</b>\n*", r"<h3>\1</h3>", text, count=1, flags=re.DOTALL)
+    media = [
+        InputRichMessageMedia(id=f"file-{index}", media=InputMediaDocument(media=file))
+        for index, file in enumerate(documents or [])
+    ]
+    html = text.replace("\n", "<br>") + "".join(
+        f'<tg-document src="tg://document?id={item.id}"></tg-document>' for item in media
+    )
+    if photos:
+        photo_media = [
+            InputRichMessageMedia(id=f"photo-{index}", media=InputMediaPhoto(media=file))
+            for index, file in enumerate(photos)
+        ]
+        html += (
+            "<tg-collage>"
+            + "".join(f'<img src="tg://photo?id={item.id}"/>' for item in photo_media)
+            + "</tg-collage>"
+        )
+        media.extend(photo_media)
+    return InputRichMessage(html=html, media=media)
 
 
 class Screen:
@@ -26,17 +58,17 @@ class Screen:
         return {
             key: value
             for key, value in route.items()
-            if key not in ("page", "text_page")
+            if key not in ("page", "text_page", "file_page")
             and not (
                 route["action"] == "week"
                 and (key == "monday" or (route.get("scope") == "day" and key == "day"))
             )
         }
 
-    def route(self, action, **payload):
+    def route(self, action, *, root=False, **payload):
         route = {"action": action, **payload}
         history = list(self.history)
-        if action == "home":
+        if root or action == "home":
             history = []
         elif self.rewinding:
             history = list(self.pending_history)
@@ -99,13 +131,23 @@ class Screen:
         self.rewinding = True
         return {"action": action, **payload}
 
-    async def answer(self, text, reply_markup=None, document=None, **kwargs):
+    async def answer(
+        self,
+        text,
+        reply_markup=None,
+        document=None,
+        documents=None,
+        photos=None,
+        rich=True,
+        back_label="⬅️ Назад",
+        **kwargs,
+    ):
         rows = list(reply_markup.inline_keyboard) if reply_markup else []
         if self.pending_history:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text="⬅️ Назад", callback_data=self.store.token(self.uid, "back")
+                        text=back_label, callback_data=self.store.token(self.uid, "back")
                     )
                 ]
             )
@@ -114,9 +156,18 @@ class Screen:
             text = self.notice + "\n\n" + text
             self.notice = None
         old_id = self.message_id
-        replace = self.media and document is None
+        replace = (self.media and document is None) or (
+            document is not None and self.message.rich_message is not None
+        )
+        rich_message = None
+        if documents or photos or (rich and document is None):
+            rich_message = attachment_message(text, documents, photos)
 
         async def send_new():
+            if rich_message is not None:
+                return await self.message.bot.send_rich_message(
+                    chat_id=self.message.chat.id, rich_message=rich_message, reply_markup=markup
+                )
             if document is not None:
                 return await self.message.answer_document(
                     document, caption=text, reply_markup=markup
@@ -134,7 +185,8 @@ class Screen:
                     )
                 else:
                     result = await self.message.bot.edit_message_text(
-                        text=text,
+                        text=None if rich_message else text,
+                        rich_message=rich_message,
                         chat_id=self.message.chat.id,
                         message_id=old_id,
                         reply_markup=markup,
